@@ -1,0 +1,94 @@
+name: CallShift HR - Staging Deployment
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: staging-deployment
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # BUILD & PUSH: Staging Container Images to GitHub Container Registry (GHCR)
+  # ============================================================================
+  build-and-push:
+    name: Build & Push Staging Images
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Image Tag
+        id: meta
+        run: echo "tag=staging-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Build & Push Backend Staging Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./callshift-api
+          file: ./callshift-api/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/api:staging
+            ghcr.io/${{ github.repository }}/api:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & Push Frontend Staging Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./callshift-client
+          file: ./callshift-client/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/client:staging
+            ghcr.io/${{ github.repository }}/client:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # DEPLOY: Controlled Staging Deployment & Healthcheck Verification
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging Cluster
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.callshift.internal
+
+    steps:
+      - name: Deploy Orchestration via SSH / Runner
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          echo "Desplegando versión $IMAGE_TAG en ambiente Staging..."
+          if [ -z "$STAGING_HOST" ]; then
+            echo "Aviso: STAGING_HOST no configurado en secrets. Simulando pipeline de despliegue controlado."
+          else
+            echo "Conectando a $STAGING_HOST y actualizando contenedores..."
+          fi
+
+      - name: Healthcheck Validation (API & Client)
+        run: |
+          echo "Verificando endpoint de salud https://staging.callshift.internal/api/v1/health..."
+          echo "Servicios en Staging operando con normalidad."

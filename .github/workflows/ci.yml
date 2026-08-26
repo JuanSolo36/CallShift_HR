@@ -1,0 +1,204 @@
+name: CallShift HR - Continuous Integration
+
+on:
+  push:
+    branches: [main, develop, 'release/**']
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # JOB 1: Backend CI (PHP 8.3 + PostgreSQL 16 + Redis 7 + Laravel Tests)
+  # ============================================================================
+  backend:
+    name: Backend Tests (PHP 8.3 & PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: callshift_test
+          POSTGRES_USER: callshift_user
+          POSTGRES_PASSWORD: callshift_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pdo, pdo_pgsql, pdo_mysql, pdo_sqlite, bcmath, intl, zip, pcntl, opcache, redis, gd
+          coverage: none
+          ini-values: memory_limit=512M, max_execution_time=120
+
+      - name: Get Composer Cache Directory
+        id: composer-cache
+        working-directory: callshift-api
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('callshift-api/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer Dependencies
+        working-directory: callshift-api
+        run: composer install --prefer-dist --no-interaction --no-progress --optimize-autoloader
+
+      - name: Prepare Laravel Environment
+        working-directory: callshift-api
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: callshift_test
+          DB_USERNAME: callshift_user
+          DB_PASSWORD: callshift_password
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          CACHE_STORE: array
+          SESSION_DRIVER: array
+          QUEUE_CONNECTION: sync
+        run: |
+          cp .env.example .env.testing 2>/dev/null || true
+          php artisan key:generate --env=testing --force || true
+          php artisan storage:link --force || true
+
+      - name: Run Database Migrations (PostgreSQL)
+        working-directory: callshift-api
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: callshift_test
+          DB_USERNAME: callshift_user
+          DB_PASSWORD: callshift_password
+        run: php artisan migrate --force
+
+      - name: Execute Backend Tests (Pest / PHPUnit)
+        working-directory: callshift-api
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: callshift_test
+          DB_USERNAME: callshift_user
+          DB_PASSWORD: callshift_password
+        run: php artisan test --compact
+
+  # ============================================================================
+  # JOB 2: Frontend CI (Node 20 + TypeScript + Unit Tests + Vite Build)
+  # ============================================================================
+  frontend:
+    name: Frontend Tests & Build (React & Vite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: callshift-client/package-lock.json
+
+      - name: Install NPM Dependencies
+        working-directory: callshift-client
+        run: npm ci
+
+      - name: Run Frontend Test Battery (7 Suites)
+        working-directory: callshift-client
+        run: |
+          npx tsx src/test/frontend.test.ts
+          npx tsx src/test/scheduleEditor.test.ts
+          npx tsx src/test/conflicts.test.ts
+          npx tsx src/test/modifications.test.ts
+          npx tsx src/test/audit.test.ts
+          npx tsx src/test/reports.test.ts
+          npx tsx src/test/systemIntegration.test.ts
+
+      - name: TypeScript Typecheck & Production Build
+        working-directory: callshift-client
+        run: npm run build
+
+      - name: Check Build Artifacts
+        working-directory: callshift-client
+        run: |
+          test -f dist/index.html || { echo "dist/index.html missing"; exit 1; }
+          test -d dist/assets || { echo "dist/assets missing"; exit 1; }
+          echo "Frontend build successfully verified."
+
+  # ============================================================================
+  # JOB 3: Docker Validation & Multi-Stage Builds
+  # ============================================================================
+  docker:
+    name: Docker Builds & Compose Validation
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Docker Compose Configuration
+        run: |
+          docker compose config > /dev/null
+          echo "docker-compose.yml configuration is valid."
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml config > /dev/null
+          echo "docker-compose.prod.yml overlay configuration is valid."
+
+      - name: Build Backend Docker Image (callshift-api)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./callshift-api
+          file: ./callshift-api/Dockerfile
+          target: production
+          push: false
+          tags: callshift-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Frontend Docker Image (callshift-client)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./callshift-client
+          file: ./callshift-client/Dockerfile
+          target: production
+          push: false
+          tags: callshift-client:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
